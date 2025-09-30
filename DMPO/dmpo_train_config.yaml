@@ -1,0 +1,91 @@
+##### ModelConfig
+use_peft: true
+torch_dtype: bfloat16
+load_in_4bit: true
+pretrained_model_path: GSAI-ML/LLaDA-8B-Instruct
+attn_implementation: flash_attention_2
+
+lora_r: 128
+lora_alpha: 64
+lora_dropout: 0.05
+peft_task_type: CAUSAL_LM
+
+##### TrainingArguments
+seed: 42
+bf16: true
+
+sync_ref_model: false
+ref_model_sync_steps: 0 # 64
+
+adam_beta1: 0.9
+adam_beta2: 0.99
+weight_decay: 0.1
+max_grad_norm: 0.2 # d1 uses 0.2, in our case most of the time the grad_norm is below 0.5
+
+use_vllm: false
+vllm_device: auto
+vllm_gpu_memory_utilization: 0.9
+
+warmup_ratio: 0.0001
+logging_steps: 1
+learning_rate: 1e-6 # 3e-6
+lr_scheduler_type: constant_with_warmup
+
+num_generations: 12 # number of generations to sample for each prompt, should = per_device_train_batch_size for convenience
+num_train_epochs: 10
+
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 6 # d1 uses 6
+gradient_accumulation_steps: 2 # d1 uses 2, use 1 here for faster debugging
+
+gradient_checkpointing: false
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+resume_from_checkpoint: false
+
+##### Parameters for saving checkpoints and uploading to cloud
+save_steps: 100
+save_strategy: steps
+save_total_limit: 1
+upload_to_google_drive: false
+google_drive_parent_folder_id: ''
+
+##### DMPO
+block_length: 32
+generation_batch_size: 6 # = per_device_train_batch_size
+num_iterations: 12 # d1 uses 12
+alpha: 0.1
+temperature: 0.5
+centering_strength: 1
+loss: "wdce" # "ddo"
+
+ddo_alpha: 1
+ddo_beta: 1
+ddo_indep_set: false
+
+
+
+# For compute_loss
+num_replicates: 4
+loss_antithetic: true
+loss_mask_prob_clamp: true
+loss_mask_non_eos: true
+
+# For _generate_and_score_completions
+## computing log RND
+log_rnd_omit_eos: false
+log_rnd_normalize_by_length: false # only for alpha > 0
+log_rnd_normalize_power: 1.0 # only for alpha > 0
+## proximal step, only for alpha >= 0
+coeff: 1.0
+ada_coeff: false
+ada_coeff_ess_threshold: 0.7
+## computing advantage
+advantage_centering: false
+advantage_centering_unbias: false
+advantage_centering_neg: false
+advantage_centering_warmup: 100
+advantage_div_std: false
+advantage_div_eta: false
+advantage_div_eta_threshold: 0.01 # only for advantage_div_eta == true
