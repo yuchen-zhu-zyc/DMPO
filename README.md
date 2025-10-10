@@ -1,7 +1,7 @@
 # Enhancing Reasoning For Diffusion LLMs via Distribution Matching Policy Optimization (DMPO)
-[![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)]()
+[![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/pdf/2510.08233)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![X](https://img.shields.io/badge/X-000000?logo=x&logoColor=white&style=flat-square)]()
+<!-- [![X](https://img.shields.io/badge/X-000000?logo=x&logoColor=white&style=flat-square)]() -->
 
 
 This is the official implementation of DMPO.
@@ -17,8 +17,7 @@ conda activate dmpo
 
 
 ## Update
-[Sep 29, 2025] We have open sourced the code of DMPO for dLLM training.
-
+[Oct 9, 2025] We have open sourced the code of DMPO for dLLM training.
 
 
 ## Acknowledgement
