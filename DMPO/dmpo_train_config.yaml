@@ -31,12 +31,12 @@ logging_steps: 1
 learning_rate: 1e-6 # 3e-6
 lr_scheduler_type: constant_with_warmup
 
-num_generations: 12 # number of generations to sample for each prompt, should = per_device_train_batch_size for convenience
+num_generations: 16 # number of generations to sample for each prompt, should be multiple of per_device_train_batch_size for convenience
 num_train_epochs: 10
 
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 6 # d1 uses 6
-gradient_accumulation_steps: 2 # d1 uses 2, use 1 here for faster debugging
+per_device_train_batch_size: 8 # d1 uses 6
+gradient_accumulation_steps: 2 # d1 uses 2
 
 gradient_checkpointing: false
 gradient_checkpointing_kwargs:
@@ -44,48 +44,67 @@ gradient_checkpointing_kwargs:
 
 resume_from_checkpoint: false
 
-##### Parameters for saving checkpoints and uploading to cloud
+##### Parameters for saving checkpoints
 save_steps: 100
 save_strategy: steps
-save_total_limit: 1
-upload_to_google_drive: false
-google_drive_parent_folder_id: ''
+save_total_limit: 5
 
 ##### DMPO
-block_length: 32
-generation_batch_size: 6 # = per_device_train_batch_size
-num_iterations: 12 # d1 uses 12
-alpha: 0.1
-temperature: 0.5
-centering_strength: 1
-loss: "wdce" # "ddo"
-
-ddo_alpha: 1
-ddo_beta: 1
-ddo_indep_set: false
-
-
+num_iterations: 8 # d1 uses 12
+alpha: 0.04
 
 # For compute_loss
+loss: wdce # wdce, ddo
 num_replicates: 4
 loss_antithetic: true
 loss_mask_prob_clamp: true
-loss_mask_non_eos: true
+loss_mask_non_eos: false
+
+compute_ref_log_prob_elbo: true
+compute_ref_log_prob_elbo_size: 4
+
+use_sft_model: false
+sft_model_path: null
+
+ddo_alpha: 1
+ddo_beta: 1
+ddo_indep_set: true
 
 # For _generate_and_score_completions
+
+## Generating rollouts
+### General sampling hyperparameters
+generation_batch_size: 8 # = per_device_train_batch_size
+block_length: 32
+temperature: 0.2
+cfg_scale: 0.0
+
+### Fast samplers by KV cache
+use_fast_sampler: fast_dllm # fast_dllm, wino, no (corresponds to LLaDA without KV cache)
+sampler: pd_cache_prefix # roar, llada, pd, pd_cache_prefix, pd_cache_dual, wino
+
+#>> the following two are only for sampler in {llada, pd, pd_cache_prefix, pd_cache_dual}
+sampler_steps: 128
+sampler_remasking: low_confidence # low_confidence, random
+
+#>> the following two are only for sampler in {pd, pd_cache_prefix, pd_cache_dual}
+sampler_threshold_pd: null
+sampler_factor: null
+
+#>> the following two are only for sampler = wino
+sampler_threshold_wino: 0.6
+sampler_threshold_wino_back: 0.9
+
 ## computing log RND
 log_rnd_omit_eos: false
-log_rnd_normalize_by_length: false # only for alpha > 0
-log_rnd_normalize_power: 1.0 # only for alpha > 0
+
 ## proximal step, only for alpha >= 0
 coeff: 1.0
 ada_coeff: false
 ada_coeff_ess_threshold: 0.7
+
 ## computing advantage
-advantage_centering: false
+advantage_centering: true
 advantage_centering_unbias: false
-advantage_centering_neg: false
-advantage_centering_warmup: 100
-advantage_div_std: false
-advantage_div_eta: false
-advantage_div_eta_threshold: 0.01 # only for advantage_div_eta == true
+advantage_centering_neg: true
+centering_strength: 1

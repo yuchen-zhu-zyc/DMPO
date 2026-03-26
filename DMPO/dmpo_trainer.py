@@ -1,6 +1,6 @@
 import torch
 from trl.trainer.grpo_trainer import GRPOTrainer
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Sized
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -13,18 +13,22 @@ from DMPO_config import DMPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
 from torch import nn
-from trl.import_utils import is_rich_available
-from accelerate.utils import gather, gather_object
-from trl.data_utils import is_conversational, maybe_apply_chat_template
+from trl.import_utils import is_rich_available, is_vllm_available
+from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from utils import print_prompt_completions_sample
 import wandb
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from fast_samplers.fast_dllm.generate import generate_llada, generate_pd, generate_with_prefix_cache, generate_with_dual_cache
+from fast_samplers.wino.generate import generate_wino
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-
 
 class DMPOTrainer(GRPOTrainer):
     """
@@ -62,136 +66,28 @@ class DMPOTrainer(GRPOTrainer):
         assert args.alpha == -1 or args.alpha >= 0.0, "Invalid alpha value"
         assert 0.0 <= args.coeff <= 1.0, "Invalid coeff value"
         assert 0.0 <= args.ada_coeff_ess_threshold <= 1.0, "Invalid ada_coeff_ess_threshold value"
-        if args.loss_antithetic and args.num_replicates % 2 == 1:
-            logger.warning("num_replicates should be even")
+        if args.loss_antithetic and (args.num_replicates % 2 == 1 or self.args.compute_ref_log_prob_elbo_size % 2 == 1):
+            logger.warning("num_replicates and compute_ref_log_prob_elbo_size should be even")
 
-    #################### inference code copied from LLADA ####################
-    def add_gumbel_noise(self, logits, temperature, dtype):
-        """
-        The Gumbel max is a method for sampling categorical distributions.
-        According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-        Thus, we use float64.
-        """
-        if temperature == 0.0:
-            return logits  # Skip noise when temperature is 0
-        logits = logits.to(dtype)
-        noise = torch.rand_like(logits, dtype=dtype)
-        gumbel_noise = (-torch.log(noise)) ** temperature
-        return logits.exp() / gumbel_noise
+        assert args.use_fast_sampler in ["fast_dllm", "wino", "no"], "Invalid fast sampler"
+        assert args.sampler in ["roar", "llada", "pd", "pd_cache_prefix", "pd_cache_dual", "wino"], "Invalid sampler"
+        if args.sampler in ["pd_cache_prefix", "pd_cache_dual"]:
+            assert args.use_fast_sampler == "fast_dllm", \
+                "Samplers `pd_cache_prefix` and `pd_cache_dual` can only be used for Fast-dLLM"
+        if args.sampler == "wino":
+            assert args.use_fast_sampler == "wino", "Sampler `wino` can only be used for WINO"
 
-    def generate(
-        self,
-        model,
-        prompt,
-        steps=128,
-        gen_length=128,
-        block_length=128,
-        temperature=0.0,
-        cfg_scale=0.0,
-        remasking="low_confidence",
-        mask_id=126336,
-    ):
-        """
-        generation code adopted from llada (https://github.com/ML-GSAI/LLaDA)
-
-        output shape: [prompt.shape[0], prompt.shape[1] + gen_length]
-        """
-        with torch.amp.autocast('cuda', enabled=True):
-            bs = prompt.shape[0]
-            dtype = model.dtype
-            x = torch.full((bs, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-            x[:, : prompt.shape[1]] = prompt.clone()
-
-            prompt_index = x != mask_id
-
-            assert gen_length % block_length == 0
-            num_blocks = gen_length // block_length
-
-            # Adjust steps if needed
-            steps_per_block = max(1, steps // num_blocks)
-
-            for num_block in range(num_blocks):
-                start_idx = prompt.shape[1] + num_block * block_length
-                end_idx = prompt.shape[1] + (num_block + 1) * block_length
-
-                block_mask_index = x[:, start_idx:end_idx] == mask_id
-                num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-                for i in range(steps_per_block):
-                    torch.cuda.empty_cache()
-                    mask_index = x == mask_id
-
-                    with torch.amp.autocast('cuda', enabled=self.args.fp16):
-                        # Handle classifier-free guidance more efficiently
-                        if cfg_scale > 0.0:
-                            un_x = x.clone()
-                            un_x[prompt_index] = mask_id
-                            x_ = torch.cat([x, un_x], dim=0)
-
-                            # Get logits in a single forward pass
-                            logits = model(x_).logits
-                            logits, un_logits = torch.chunk(logits, 2, dim=0)
-                            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-                        else:
-                            logits = model(x).logits
-
-                        # Apply Gumbel noise for sampling
-                        logits_with_noise = self.add_gumbel_noise(
-                            logits, temperature=temperature, dtype=dtype
-                        )
-                        x0 = torch.argmax(logits_with_noise, dim=-1)
-                        del logits_with_noise
-
-                        # Handle remasking strategy
-                        if remasking == "low_confidence":
-                            p = F.softmax(logits.to(dtype), dim=-1)
-                            x0_p = torch.squeeze(
-                                torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-                            )
-                        elif remasking == "random":
-                            x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-                        else:
-                            raise NotImplementedError(remasking)
-
-                        # Ensure we don't process tokens beyond the current block
-                        x0_p[:, end_idx:] = -np.inf
-
-                        # Update masked tokens
-                        x0 = torch.where(mask_index, x0, x)
-                        confidence = torch.where(mask_index, x0_p, -np.inf)
-
-                        # Select tokens to transfer based on confidence
-                        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                        for j in range(confidence.shape[0]):
-                            num_tokens = num_transfer_tokens[j, i].item()
-                            if num_tokens > 0:
-                                _, select_index = torch.topk(confidence[j], k=num_tokens)
-                                transfer_index[j, select_index] = True
-
-                        x[transfer_index] = x0[transfer_index]
-                        del x0, confidence, transfer_index
-
-            return x
-
-    def get_num_transfer_tokens(self, mask_index, steps):
-        """
-        Precompute the number of tokens to transition at each step.
-        Optimized to be more efficient.
-        """
-        mask_num = mask_index.sum(dim=1, keepdim=True)
-        base = mask_num // steps
-        remainder = mask_num % steps
-
-        # Create tensor once and modify in-place
-        num_transfer_tokens = base.expand(-1, steps).clone()
-
-        # Handle remainder more efficiently
-        if remainder.sum() > 0:
-            indices = torch.arange(steps, device=mask_index.device)
-            mask = indices.unsqueeze(0) < remainder
-            num_transfer_tokens[mask] += 1
-
-        return num_transfer_tokens.to(torch.int64)
+        if args.sampler != "roar":
+            if not self.args.compute_ref_log_prob_elbo:
+                self.args.compute_ref_log_prob_elbo = True
+                warnings.warn("`self.args.compute_ref_log_prob_elbo` set to True! "
+                              "Require ELBO to approximate sequence log probability.")
+            self.generate = {"llada": generate_llada,
+                             "pd": generate_pd,
+                             "pd_cache_prefix": generate_with_prefix_cache,
+                             "pd_cache_dual": generate_with_dual_cache,
+                             "wino": generate_wino,
+                             }[args.sampler]
 
     #################### loss computation and buffer preparation ####################
 
@@ -215,20 +111,6 @@ class DMPOTrainer(GRPOTrainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
-    @staticmethod
-    def sample_masked_index(m, D):
-        """
-        m: [bsz], each element in [0, D]
-        Returns a boolean mask of shape [bsz, D]: in the b-th row, the number of True is exactly m[b].
-        """
-        bsz = m.shape[0]
-        sorted_indices = torch.rand(bsz, D, device=m.device).argsort(dim=1)
-        # [bsz, D], each row is random permutation of range(D)
-        mask = torch.arange(D, device=m.device).expand(bsz, D) < m.unsqueeze(1)
-        # [bsz, D], the b-th row is True for the first m[b] elements
-        masked_index = torch.zeros(bsz, D, dtype=torch.bool, device=m.device)
-        masked_index.scatter_(dim=1, src=mask, index=sorted_indices)
-        return masked_index
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -238,12 +120,10 @@ class DMPOTrainer(GRPOTrainer):
         prompt_ids = inputs["prompt_ids"] # [bs, prompt_length]
         batch_size = prompt_ids.shape[0]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"] # both [bs, gen_length]
-        advantages = inputs["advantages"] # [bs]
-        negative_advantages = inputs["negative_advantages"] # [bs]
+        advantages, negative_advantages = inputs["advantages"], inputs["negative_advantages"] # both [bs]
         log_prob_cur = inputs["log_prob_cur"] # [bs]
         coeff = inputs["coeff"] # [1]
         
-
         prompt_ids, completion_ids, completion_mask = [
             x.repeat([self.args.num_replicates, 1]) for x in [prompt_ids, completion_ids, completion_mask]]
         # [bs * num_replicates, prompt_length or gen_length]
@@ -267,10 +147,8 @@ class DMPOTrainer(GRPOTrainer):
         full_masked_index = torch.full(input_ids.shape, False, device=model.device)
         full_masked_index[:, -gen_length:] = masked_index
         # [bs * num_replicates, seq_len], do not mask the prompt
-        m = masked_index.sum(dim=-1) # [bs * num_replicates], number of masks in each row
-        m_clamp = m.clamp(min=1)
+        m = masked_index.sum(dim=-1).clamp(min=1) # [bs * num_replicates], number of masks in each row, clamped to >= 1
         del masked_index
-        weights = 1 / m # theoretically should be gen_length / m, we remove gen_length (fixed throughout) for smaller loss scales
 
         perturbed_input_ids = torch.where(full_masked_index, self.args.mask_id, input_ids)
         logits = model(perturbed_input_ids).logits # [bs * num_replicates, seq_len, vocab_size]
@@ -281,18 +159,17 @@ class DMPOTrainer(GRPOTrainer):
         losses[~full_masked_index] = 0
         
         if self.args.loss == "wdce":
-            log_prob_theta = (-losses).clone().detach()
-            log_prob_theta = log_prob_theta.view(self.args.num_replicates, batch_size, -1).transpose(0, 1) # [bs, num_replicates, seq_len]
-            t_weights = (gen_length / m_clamp).view(self.args.num_replicates, batch_size, 1).transpose(0, 1) # [bs, num_replicates, 1]
+            advantages, negative_advantages = [
+                x.repeat(self.args.num_replicates) for x in [advantages, negative_advantages]] # [bs * num_replicates]
 
-            log_prob_theta = (t_weights * log_prob_theta).mean(dim = 1).sum(dim = 1) # [bs]
-            
-            advantages = advantages.repeat(self.args.num_replicates)  # [bs * num_replicates]
-            negative_advantages = negative_advantages.repeat(self.args.num_replicates)  # [bs * num_replicates]
-            
-            ## Move to loss computation
             if self.args.advantage_centering:
-                if self.args.advantage_centering_unbias and self.state.global_step > self.args.advantage_centering_warmup:
+                if self.args.advantage_centering_unbias:
+                    # first compute log_prob_theta(x)
+                    log_prob_theta = (-losses).clone().detach()
+                    log_prob_theta = log_prob_theta.view(self.args.num_replicates, batch_size, -1).transpose(0, 1) # [bs, num_replicates, seq_len]
+                    t_weights = (gen_length / m).view(self.args.num_replicates, batch_size, 1).transpose(0, 1) # [bs, num_replicates, 1]
+                    log_prob_theta = (t_weights * log_prob_theta).mean(dim = 1).sum(dim = 1) # [bs]
+
                     centering_factor = (log_prob_theta - log_prob_cur).softmax(dim = -1)
                     centering_factor = centering_factor.repeat(self.args.num_replicates)
                 elif self.args.advantage_centering_neg:
@@ -301,21 +178,14 @@ class DMPOTrainer(GRPOTrainer):
                     centering_factor = advantages.mean(dim=-1, keepdim=True)
                 advantages -= self.args.centering_strength * centering_factor
                 
-            if self.args.advantage_div_std:
-                advantages /= advantages.std(dim=-1, keepdim=True).clamp(min=1e-6)
-            elif self.args.alpha != -1 and self.args.ada_coeff and self.args.advantage_div_eta:
-                etas = coeff / (1 - coeff) / self.args.alpha if self.args.alpha > 0.0 else coeff
-                etas[etas > self.advantage_div_eta_threshold] = 1.0
-                advantages /= etas.clamp(min=1e-6)
             
-            
-            loss = (losses.sum(dim=-1) * weights * advantages)[m!=0].sum() / self.args.num_replicates
+            loss = (losses.sum(dim=-1) / m * advantages).sum() / self.args.num_replicates
+            # theoretically should be gen_length / m, we remove gen_length (fixed throughout) for smaller loss scales
             return loss
         
         elif self.args.loss == "ddo":
-            log_prob_theta = -losses
-            log_prob_theta = log_prob_theta.view(self.args.num_replicates, batch_size, -1).transpose(0, 1) # [bs, num_replicates, seq_len]
-            t_weights = (gen_length / m_clamp).view(self.args.num_replicates, batch_size, 1).transpose(0, 1) # [bs, num_replicates, 1]
+            log_prob_theta = (-losses).view(self.args.num_replicates, batch_size, -1).transpose(0, 1) # [bs, num_replicates, seq_len]
+            t_weights = (gen_length / m).view(self.args.num_replicates, batch_size, 1).transpose(0, 1) # [bs, num_replicates, 1]
             
             if self.args.ddo_indep_set:
                 log_prob_theta = (t_weights * log_prob_theta).reshape(batch_size, 2, self.args.num_replicates // 2, -1).mean(dim = 2).sum(dim = -1)
@@ -334,6 +204,69 @@ class DMPOTrainer(GRPOTrainer):
             return loss
         else:
             raise NotImplementedError(self.args.loss)
+
+    @torch.no_grad()
+    def compute_log_prob_elbo(self, model, prompt_ids, completion_ids, completion_mask, repeated_size):
+        """
+        Compute the ELBO of a batch of samples
+        Args:
+            prompt_ids: [bs, prompt_length]
+            completion_ids: [bs, gen_length]
+            completion_mask: [bs, gen_length]
+            repeated_size: int
+        
+        Return:
+            log_prob_ref, log_prob_cur: [bs, seq_len], per-token log probability
+
+        # TODO: maybe also consider EUBO as in https://arxiv.org/abs/2510.09541 and use the average?
+        """
+        batch_size = prompt_ids.shape[0]
+        gen_length = completion_ids.shape[1]
+
+        prompt_ids, completion_ids, completion_mask = [
+            x.repeat([repeated_size, 1]) for x in [prompt_ids, completion_ids, completion_mask]]
+        # [bs * num_replicates, prompt_length or gen_length]
+        # Combine prompt and completion
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1) # [bs * num_replicates, seq_len = prompt_length + gen_length]
+        del prompt_ids, completion_ids
+
+        if not self.args.loss_antithetic:
+            lamda = torch.rand(input_ids.shape[0], device=model.device) # [bs * num_replicates]
+            if self.args.loss_mask_prob_clamp: lamda = 0.1 + 0.9 * lamda # now in [0.1, 0.9]
+            masked_index = torch.rand(input_ids.shape[0], gen_length, device=model.device) < lamda.unsqueeze(1) # [bs * num_replicates, gen_length]
+        else:
+            lamda = torch.rand(input_ids.shape[0] // 2, device=model.device) # [bs * num_replicates / 2]
+            if self.args.loss_mask_prob_clamp: lamda = 0.1 + 0.9 * lamda # now in [0.1, 0.9]
+            masked_index = torch.rand(input_ids.shape[0] // 2, gen_length, device=model.device) < lamda.unsqueeze(1) # [bs * num_replicates / 2, gen_length]
+            masked_index = torch.cat([masked_index, ~masked_index], dim=0) # [bs * num_replicates, gen_length]
+            
+        full_masked_index = torch.full(input_ids.shape, False, device=model.device)
+        full_masked_index[:, -gen_length:] = masked_index
+        # [bs * num_replicates, seq_len], do not mask the prompt
+        m = masked_index.sum(dim=-1).clamp(min=1) # [bs * num_replicates], number of masks in each row, clamped to >= 1
+        del masked_index
+
+        perturbed_input_ids = torch.where(full_masked_index, self.args.mask_id, input_ids)
+        logits_cur = model(perturbed_input_ids).logits # [bs * num_replicates, seq_len, vocab_size]
+        
+        with self.accelerator.unwrap_model(model).disable_adapter():
+            logits_ref = model(perturbed_input_ids).logits # [bs * num_replicates, seq_len, vocab_size]
+        
+        losses_cur = F.cross_entropy(input=logits_cur.view(-1, logits_cur.shape[-1]), target=input_ids.view(-1), reduction='none').view(logits_cur.shape[:-1])
+        # [N := bs * num_replicates * seq_len, vocab_size], [N] -> [N] -> [bs * num_replicates, seq_len], don't require logits to be log-softmaxed
+        losses_cur[~full_masked_index] = 0
+        log_prob_cur = (-losses_cur).view(repeated_size, batch_size, -1).transpose(0, 1) # [bs, repeated_size, seq_len]
+        t_weights = (gen_length / m).view(-1, batch_size, 1).transpose(0, 1) # [bs, repeated_size, 1]
+        log_prob_cur = (t_weights * log_prob_cur).mean(dim = 1) # [bs, seq_len]
+        
+        losses_ref = F.cross_entropy(input=logits_ref.view(-1, logits_ref.shape[-1]), target=input_ids.view(-1), reduction='none').view(logits_ref.shape[:-1])
+        losses_ref[~full_masked_index] = 0
+        log_prob_ref = (-losses_ref).view(repeated_size, batch_size, -1).transpose(0, 1) # [bs, repeated_size, seq_len]
+        t_weights = (gen_length / m).view(-1, batch_size, 1).transpose(0, 1) # [bs, repeated_size, 1]
+        log_prob_ref = (t_weights * log_prob_ref).mean(dim = 1) # [bs, seq_len]
+        
+        return log_prob_ref, log_prob_cur
+
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         r"""
@@ -361,29 +294,63 @@ class DMPOTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
-        # Configuration for the diffusion generation
-        gen_length = self.args.max_completion_length
-        block_length = self.args.block_length
-        temperature = self.args.temperature or 0.0 # i.e., if not provided, use 0
-        cfg_scale = self.args.cfg_scale
-
         # generate roll-outs from the current model and compute the log rnd
         generation_batch_size = self.args.generation_batch_size
         prompt_completion_ids = []; log_prob_pre = []; log_prob_cur = []
         for i in range(0, prompt_ids.size(0), generation_batch_size):
             end_idx = min(i + generation_batch_size, prompt_ids.size(0))
-            batch_prompt_completion_ids, batch_log_prob_pre, batch_log_prob_cur = self.generate_and_compute_log_rnd(
-                prompt=prompt_ids[i:end_idx],
-                gen_length=gen_length,
-                block_length=block_length,
-                temperature=temperature,
-                cfg_scale=cfg_scale,
-                mask_id=self.args.mask_id,
-            ) # [mbs (= end_idx - i), total_length (= prompt_length + gen_length)]; [mbs, gen_length]
+            if self.args.sampler == 'roar':
+                batch_prompt_completion_ids, batch_log_prob_pre, batch_log_prob_cur = self.generate_and_compute_log_rnd(
+                    prompt=prompt_ids[i:end_idx],
+                    gen_length=self.args.max_completion_length,
+                    block_length=self.args.block_length,
+                    temperature=self.args.temperature,
+                    cfg_scale=self.args.cfg_scale,
+                    mask_id=self.args.mask_id,
+                ) # [mbs (= end_idx - i), seq_len (= prompt_length + gen_length)]; both [mbs, gen_length]
+            else:
+                batch_prompt_completion_ids = self.generate(
+                    model=self.model,
+                    prompt=prompt_ids[i:end_idx],
+                    steps=self.args.sampler_steps,
+                    gen_length=self.args.max_completion_length,
+                    block_length=self.args.block_length,
+                    temperature=self.args.temperature,
+                    cfg_scale=self.args.cfg_scale,
+                    remasking=self.args.sampler_remasking,
+                    mask_id=self.args.mask_id,
+
+                    threshold_pd=self.args.sampler_threshold_pd,
+                    factor=self.args.sampler_factor,
+                    
+                    threshold_wino=self.args.sampler_threshold_wino,
+                    threshold_wino_back=self.args.sampler_threshold_wino_back,
+                ) # [mbs, seq_len]
+
+            if self.args.compute_ref_log_prob_elbo:
+                # approximate sequence log probabilities under both p_theta and p_pre by ELBO, used for computing advantage
+                # note that we cannot do so when computing loss as the parameters may have been changed
+                prompt_length_ref = prompt_ids.size(1)
+                is_eos = batch_prompt_completion_ids[:, prompt_length_ref:] == self.processing_class.eos_token_id
+                eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device) # [bs], default value gen_length
+                eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+                # [bs], i.e., length before the first EOS token
+                sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+                batch_completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+                # [bs, gen_length], everything after the first EOS token is False
+            
+                batch_log_prob_pre, batch_log_prob_cur = self.compute_log_prob_elbo(
+                        model=self.model,
+                        prompt_ids=batch_prompt_completion_ids[:, :prompt_length_ref],
+                        completion_ids=batch_prompt_completion_ids[:, prompt_length_ref:],
+                        completion_mask=batch_completion_mask,
+                        repeated_size=self.args.compute_ref_log_prob_elbo_size)
+                # both [mbs, gen_length]
+                
             prompt_completion_ids.append(batch_prompt_completion_ids); log_prob_pre.append(batch_log_prob_pre); log_prob_cur.append(batch_log_prob_cur)
             del batch_prompt_completion_ids, batch_log_prob_pre, batch_log_prob_cur
-
-        prompt_completion_ids = torch.cat(prompt_completion_ids, dim=0) # [bs, total_length]
+            
+        prompt_completion_ids = torch.cat(prompt_completion_ids, dim=0) # [bs, seq_len]
         log_prob_pre = torch.cat(log_prob_pre, dim=0) # [bs, gen_length]
         log_prob_cur = torch.cat(log_prob_cur, dim=0) # [bs, gen_length]
         torch.cuda.empty_cache()
@@ -404,14 +371,9 @@ class DMPOTrainer(GRPOTrainer):
         # [bs, gen_length], everything after the first EOS token is False
 
         if self.args.log_rnd_omit_eos:
-            # do not count the log rnd after the first EOS token
-            log_prob_pre *= completion_mask
-            log_prob_cur *= completion_mask
-        if self.args.log_rnd_normalize_by_length: # not recommended, prone to early collapse
-            log_prob_pre /= eos_idx.unsqueeze(1) ** self.args.log_rnd_normalize_power
-            log_prob_cur /= eos_idx.unsqueeze(1) ** self.args.log_rnd_normalize_power
-        log_prob_pre = log_prob_pre.sum(dim=1) # [bs]
-        log_prob_cur = log_prob_cur.sum(dim=1) # [bs]
+            # do not count the log probabilities after the first EOS token
+            log_prob_pre *= completion_mask; log_prob_cur *= completion_mask
+        log_prob_pre = log_prob_pre.sum(dim=1); log_prob_cur = log_prob_cur.sum(dim=1) # [bs]
 
         ##### the following lines are copied from the original implementation #####
         # Decode the generated completions
@@ -466,9 +428,8 @@ class DMPOTrainer(GRPOTrainer):
         # [bs, num_reward_funcs] -> [num_processes * bs, num_reward_funcs]
         ##### the above lines are copied from the original implementation #####
 
-        log_prob_pre = gather(log_prob_pre) # [bs] -> [num_processes * bs]
-        log_prob_cur = gather(log_prob_cur) # [bs] -> [num_processes * bs]
-        log_rnds = log_prob_pre - log_prob_cur # [bs] -> [num_processes * bs]
+        log_prob_pre = gather(log_prob_pre); log_prob_cur = gather(log_prob_cur) # [bs] -> [num_processes * bs]
+        log_rnds = log_prob_pre - log_prob_cur # [num_processes * bs]
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)  # [num_processes * bs]
@@ -480,7 +441,6 @@ class DMPOTrainer(GRPOTrainer):
         
         grouped_log_rnds = grouped_log_prob_pre - grouped_log_prob_cur
         
-        # TODO: add different ways of computing advantage, including variance reduction
         if self.args.alpha != -1: # compute advantage as in (P)CE
 
             # TODO: also adaptive alpha?
@@ -493,16 +453,15 @@ class DMPOTrainer(GRPOTrainer):
                                                    self.args.alpha, self.args.ada_coeff_ess_threshold)
 
             if self.args.alpha > 0.0:
-                grouped_advantages = (coeffs * (grouped_log_rnds + grouped_rewards / self.args.alpha)).softmax(dim=-1) # [num_processes, bs]
-                negative_grouped_advantages = (coeffs * (grouped_log_rnds - grouped_rewards / self.args.alpha)).softmax(dim=-1)
+                grouped_advantages = (coeffs * (grouped_log_rnds + grouped_rewards / self.args.alpha)).reshape(-1, self.args.num_generations).softmax(dim=-1).reshape(grouped_rewards.shape)
+                negative_grouped_advantages = (coeffs * (grouped_log_rnds - grouped_rewards / self.args.alpha)).reshape(-1, self.args.num_generations).softmax(dim=-1).reshape(grouped_rewards.shape)
             else:
-                grouped_advantages = (coeffs * grouped_rewards).softmax(dim=-1) # [num_processes, bs]
-                negative_grouped_advantages = (-coeffs * grouped_rewards).softmax(dim=-1)
+                grouped_advantages = (coeffs * grouped_rewards).reshape(-1, self.args.num_generations).softmax(dim=-1).reshape(grouped_rewards.shape) # [num_processes, bs]
+                negative_grouped_advantages = (-coeffs * grouped_rewards).reshape(-1, self.args.num_generations).softmax(dim=-1).reshape(grouped_rewards.shape)
             ess = 1 / grouped_advantages.square().sum(dim=-1) / grouped_advantages.shape[-1] # [num_processes]
         else: # use the reward as the advantage
             grouped_advantages = grouped_rewards.clone() # [num_processes, bs]
             negative_grouped_advantages = -grouped_rewards.clone() # [num_processes, bs]
-        # raw_grouped_advantages = grouped_advantages.clone()
         
         
         advantages = grouped_advantages[self.accelerator.process_index] # [bs]
@@ -544,10 +503,11 @@ class DMPOTrainer(GRPOTrainer):
         self._metrics[mode]["advantage"].append(mean_grouped_advantages.mean().item())
         self._metrics[mode]["advantage_std"].append(std_grouped_advantages.mean().item())
         if self.args.alpha != -1:
-            self._metrics[mode]["coeff"].append(coeffs.mean().item())
-            self._metrics[mode]["coeff_std"].append(coeffs.std().item())
             self._metrics[mode]["ess"].append(ess.mean().item())
             self._metrics[mode]["ess_std"].append(ess.std().item())
+            if self.args.ada_coeff:
+                self._metrics[mode]["coeff"].append(coeffs.mean().item())
+                self._metrics[mode]["coeff_std"].append(coeffs.std().item())
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
@@ -612,7 +572,7 @@ class DMPOTrainer(GRPOTrainer):
         Return:
             x: final full samples generated under the current model
                 shape [batch_size, prompt_length + gen_length]
-            log_rnd: per-token log probability difference: log p_{\theta_{pre}} / p_{\theta} (x)
+            log_prob_pre, log_prob_cur: per-token log probabilities: log p_{\theta_{pre}} (x), log p_\theta (x)
                 shape [batch_size, gen_length]
         '''
         batch_size = prompt.shape[0]; batch_arange = torch.arange(batch_size, device=self.model.device)
@@ -633,7 +593,6 @@ class DMPOTrainer(GRPOTrainer):
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
                     logits = model(x).logits
-                # logits[:, :, mask_id] = -np.inf # may not be necessary?
                 return logits.log_softmax(dim=-1)
 
         log_prob_pre_arr = torch.zeros((batch_size, gen_length), device=self.model.device, dtype=torch.bfloat16)
@@ -647,11 +606,13 @@ class DMPOTrainer(GRPOTrainer):
                 logits_jump_pos = logits[batch_arange, order[:, d]] # [batch_size, vocab_size]
                 update = self.sample_categorical_logits(logits_jump_pos, temperature=temperature) # [batch_size]
                 log_prob_cur = logits_jump_pos[batch_arange, update] # [batch_size]
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    logits_pre = get_cfg_logits(x, self.model)
-                log_prob_pre = logits_pre[batch_arange, order[:, d], update] # [batch_size]
-                log_prob_pre_arr[batch_arange, order[:, d] - prompt.shape[1]] = log_prob_pre
                 log_prob_cur_arr[batch_arange, order[:, d] - prompt.shape[1]] = log_prob_cur
+                if not self.args.compute_ref_log_prob_elbo:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        logits_pre = get_cfg_logits(x, self.model)
+                    log_prob_pre = logits_pre[batch_arange, order[:, d], update] # [batch_size]
+                    log_prob_pre_arr[batch_arange, order[:, d] - prompt.shape[1]] = log_prob_pre
+                
                 x[batch_arange, order[:, d]] = update
 
         torch.cuda.empty_cache()

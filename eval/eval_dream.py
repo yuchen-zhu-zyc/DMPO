@@ -177,7 +177,7 @@ if __name__ == "__main__":
     local_rank = setup_ddp()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/data1/shared/LLaDA-8B-Instruct/")
+    parser.add_argument("--model_path", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--few_shot", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(

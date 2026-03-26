@@ -1,6 +1,9 @@
-import os
+import os, sys
 import torch
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from fast_samplers.fast_dllm.modeling_llada import LLaDAModelLM as AutoModelFastdLLM
+from fast_samplers.wino.modeling_llada import LLaDAModelLM as AutoModelWino
 from trl import TrlParser, ModelConfig
 from peft import LoraConfig
 
@@ -26,6 +29,7 @@ from data_utils import (
     set_random_seed,
     get_math_questions,
 )
+
 
 def main(dmpo_config, model_config):
 
@@ -76,8 +80,15 @@ def main(dmpo_config, model_config):
     )
 
     # Load model and tokenizer
-    model = AutoModel.from_pretrained(
-        dmpo_config.pretrained_model_path,
+    ModelClass = {
+        "fast_dllm": AutoModelFastdLLM,
+        "wino": AutoModelWino,
+        }.get(dmpo_config.use_fast_sampler, AutoModel)
+    
+    model_load_path = dmpo_config.pretrained_model_path if not dmpo_config.use_sft_model else dmpo_config.sft_model_path
+    
+    model = ModelClass.from_pretrained(
+        model_load_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_config,
@@ -101,21 +112,14 @@ def main(dmpo_config, model_config):
         lora_dropout=model_config.lora_dropout,
     )
 
-    # Configure Google Drive uploader callback if required
-    if dmpo_config.upload_to_google_drive:
-        from drive_utils import GoogleDriveUploaderCallback
-        callback = [GoogleDriveUploaderCallback(dmpo_config)]
-    else:
-        callback = None
-
     # Initialize and run trainer
     trainer = DMPOTrainer(
         args=dmpo_config,
         model=model,
         peft_config=peft_config,
+        processing_class=tokenizer,
         reward_funcs=reward_functions,
         train_dataset=train_set,
-        callbacks=callback,
     )
 
     trainer.train(resume_from_checkpoint=dmpo_config.resume_from_checkpoint)

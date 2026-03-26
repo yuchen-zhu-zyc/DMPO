@@ -1,7 +1,7 @@
 #!/bin/bash
 # Note: If this file is called from loop.sh, then --job-name and --output below will be overridden
 
-#SBATCH --job-name=pce
+#SBATCH --job-name=dmpo
 #SBATCH --partition=coe-gpu
 #SBATCH --gres=gpu:H200:8
 #SBATCH --time=02:00:00
@@ -25,12 +25,11 @@ echo "Run name: ${RUN_NAME}"
 
 
 
-LOGDIR="${LOG_DIR:-"/storage/ice-shared/ae3530b/yzhu738/PCE-outputs/gsm8k/${RUN_NAME}"}"
-# LOGDIR="${LOG_DIR:-"../outputs/${RUN_NAME}"}"
-mkdir -p "${LOGDIR}"
-echo "Training logs and checkpoints will be saved to: ${LOGDIR}"
-
 DATASET="${DATASET:-"gsm8k"}"
+
+LOG_DIR="${LOG_DIR:-"../outputs/${DATASET}/${RUN_NAME}"}"
+mkdir -p "${LOG_DIR}"
+echo "Training logs and checkpoints will be saved to: ${LOG_DIR}"
 
 MIN_PORT=10000; MAX_PORT=65535; RANDOM_PORT=$(( RANDOM % (MAX_PORT - MIN_PORT + 1) + MIN_PORT ))
 
@@ -47,27 +46,31 @@ fi
 srun accelerate launch \
     --config_file accelerate.yaml \
     --num_processes $NUM_PROCESSES \
-    --main_process_port $RANDOM_PORT pce_train_draft.py \
-    --config pce_train_config.yaml \
+    --main_process_port $RANDOM_PORT dmpo_train.py \
+    --config dmpo_train_config.yaml \
     --dataset $DATASET \
     --run_name $RUN_NAME \
-    --output_dir $LOGDIR \
+    --output_dir $LOG_DIR \
     ${RESUME_FLAG} \
     --advantage_centering true \
     --advantage_centering_unbias false \
     --advantage_centering_neg true \
+    --compute_ref_log_prob_elbo true \
+    --compute_ref_log_prob_elbo_size 4 \
     --centering_strength 1.0 \
     --alpha 0.04 \
     --num_generations 16 \
     --num_iterations 8 \
-    --per_device_train_batch_size 8 \
+    --per_device_train_batch_size 4 \
     --sync_ref_model true \
     --ref_model_sync_steps 64 \
     --generation_batch_size 8 \
-    --temperature 0.0 \
-    --save_total_limit 5 \
-    --advantage_centering_warmup 0 \
+    --save_total_limit 10 \
     --loss_mask_non_eos false \
     --loss "wdce" \
+    --use_fast_sampler "fast_dllm" \
+    --sampler "pd_cache_prefix" \
+    --temperature 0.2 \
+    --pretrained_model_path "GSAI-ML/LLaDA-8B-Instruct"
 
 # Note: append additional training arguments above, but avoid changing the config file

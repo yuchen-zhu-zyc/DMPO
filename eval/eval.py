@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import sys
 import os
 import random
 import time
@@ -13,11 +14,18 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 from peft import PeftModel
 
-from generate import generate
+from generate import generate, generate_wino
+
 from gsm8k import GSM8KDataset
 from math500 import MATH500Dataset
 from countdown import CTDDataset
 from sudoku import SudokuDataset
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from fast_samplers.fast_dllm.generate import generate_pd, generate_with_prefix_cache, generate_with_dual_cache
+from fast_samplers.wino.generate import generate_wino
+from fast_samplers.fast_dllm.modeling_llada import LLaDAModelLM as AutoModelFastdLLM
+from fast_samplers.wino.modeling_llada import LLaDAModelLM as AutoModelWino
 
 DATASET_MAP = {
     "gsm8k": GSM8KDataset,
@@ -56,12 +64,20 @@ def evaluate(
     cfg_scale=0.0,
     steps=64,
     block_length=32,
+    sampler="llada",
+    **kwargs
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
     wall_times = []
     all_generations = []
     device = model.device
+    generate_fn = {"llada": generate,
+                   "pd": generate_pd,
+                   "pd_cache_prefix": generate_with_prefix_cache,
+                   "pd_cache_dual": generate_with_dual_cache,
+                   "wino": generate_wino,
+                   }.get(sampler, generate)
 
     for batch in tqdm(dataloader, disable=(dist.get_rank() != 0)):
         start_time = time.time()
@@ -70,16 +86,16 @@ def evaluate(
         questions = batch["questions"]
         prompts = batch["prompts"]
 
-        out = generate(
+        out = generate_fn(
             model,
             input_ids,
-            tokenizer,
             steps=steps,
             gen_length=gen_length,
             block_length=block_length,
             temperature=temperature,
             cfg_scale=cfg_scale,
             remasking="low_confidence",
+            **kwargs
         )
 
         generated_texts = tokenizer.batch_decode(out[:, -gen_length:], skip_special_tokens=False)
@@ -175,7 +191,9 @@ if __name__ == "__main__":
     local_rank = setup_ddp()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/data1/shared/LLaDA-8B-Instruct/")
+    parser.add_argument("--model_path", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
+    parser.add_argument("--use_fast_sampler", type=str, default="no", choices=["no", "fast_dllm", "wino"])
+    parser.add_argument("--sampler", type=str, default="llada", choices=["llada", "pd", "pd_cache_prefix", "pd_cache_dual", "wino"])
     parser.add_argument("--few_shot", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
@@ -190,6 +208,8 @@ if __name__ == "__main__":
     parser.add_argument("--dont_save", action="store_true")
     parser.add_argument("--output_dir", type=str, default="results/")
     parser.add_argument("--dont_use_box", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    
     parser.add_argument("--full_steps", action="store_true")
     args = parser.parse_args()
 
@@ -200,9 +220,12 @@ if __name__ == "__main__":
 
     num_evals = {"gsm8k": -1, "math": -1, "countdown": 256, "sudoku": 256}
 
-    model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
-        local_rank
-    )
+    ModelClass = {
+        "fast_dllm": AutoModelFastdLLM,
+        "wino": AutoModelWino,
+        }.get(args.use_fast_sampler, AutoModel)
+
+    model = ModelClass.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(local_rank)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
@@ -254,6 +277,7 @@ if __name__ == "__main__":
         gen_length=args.gen_length,
         block_length=args.block_length,
         steps=args.diffusion_steps,
+        sampler=args.sampler,
     )
 
     if not args.dont_save:

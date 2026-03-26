@@ -16,10 +16,74 @@ class DMPOConfig(GRPOConfig):
     """
 
     # Parameters that control generation
+    generation_batch_size: Optional[int] = field(
+        default=16,
+        metadata={"help": "Batch size for generation. If not set, the batch size will be equal to the number of generations."},
+    )
+    mask_id: int = field(
+        default=126336,
+        metadata={"help": "Mask token id. Default is from Llada"},
+    )
+    block_length: Optional[int] = field(
+        default=32, # following d1
+        metadata={"help": "diffusion block length"},
+    )
     temperature: float = field(
-        default=0.9, # GRPOConfig default 0.9
+        default=0.2, # GRPOConfig default 0.9
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
     )
+    cfg_scale: Optional[float] = field(
+        default=0.0,
+        metadata={"help": "Classifier-free guidance scale. 0.0 means no guidance."},
+    )
+
+    use_fast_sampler: str = field(
+        default="fast_dllm",
+        metadata={"help": "Whether to use fast samplers with KV cache for training. "
+                          "Can be 'fast_dllm', 'wino', or 'no' (use the default sampler in the model)."},
+    )
+    sampler: str = field(
+        default="pd_cache_prefix",
+        metadata={"help": "The sampler to use for generating roll-outs. Can be:\n"
+                          "roar: (blockwise) random order autoregressive (default).\n"
+                          "llada: the default sampler in LLaDA.\n"
+                          "pd: confidence-aware parallel decoding as in Fast-dLLM (without KV cache).\n"
+                          "pd_cache_prefix, pd_cache_dual: confidence-aware parallel decoding as in Fast-dLLM (with KV cache).\n"
+                          "wino: Wide-In, Narrow-Out (with KV cache).\n"
+                          },
+    )
+
+    sampler_steps: int = field(
+        default=128,
+        metadata={"help": "Number of steps for sampling in non-roar samplers, "
+                          "including llada, pd, pd_cache_prefix, pd_cache_dual. "
+                          "Note that max_completion_length = 256."}
+    )
+    sampler_remasking: str = field(
+        default="low_confidence",
+        metadata={"help": "Remasking strategy for non-roar samplers, "
+                          "including llada, pd, pd_cache_prefix, pd_cache_dual. "
+                          "Can be 'low_confidence' or 'random'."},
+    )
+
+    sampler_threshold_pd: Optional[float] = field(
+        default=None,
+        metadata={"help": "Confidence threshold, only for pd, pd_cache_prefix, pd_cache_dual."}
+    )
+    sampler_factor: Optional[int] = field(
+        default=None,
+        metadata={"help": "Factor, only for pd, pd_cache_prefix, pd_cache_dual."}
+    )
+
+    sampler_threshold_wino: float = field(
+        default=0.6,
+        metadata={"help": "Confidence threshold, only for wino."}
+    )
+    sampler_threshold_wino_back: float = field(
+        default=0.9,
+        metadata={"help": "Confidence threshold, only for wino."}
+    )
+
 
     # Parameters that control the data preprocessing
     max_prompt_length: Optional[int] = field(
@@ -37,9 +101,12 @@ class DMPOConfig(GRPOConfig):
 
     # Parameters that control the training
     num_iterations: int = field(
-        default=10,
+        default=8,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm). "
                   "Refresh the buffer every num_iterations gradient updates."},
+    )
+    dataset: Optional[str] = field(
+        default="gsm8k",
     )
 
     # Parameters that control the logging
@@ -50,46 +117,10 @@ class DMPOConfig(GRPOConfig):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
-    generation_batch_size: Optional[int] = field(
-        default=4,
-        metadata={
-            "help": "Batch size for generation. If not set, the batch size will be equal to the number of generations."
-        },
-    )
-    block_length: Optional[int] = field(
-        default=32, # following d1
-        metadata={"help": "diffusion block length"},
-    )
-    cfg_scale: Optional[float] = field(
-        default=0.0,
-    )
-    remasking: Optional["str"] = field(
-        default="low_confidence",
-    )
-    dataset: Optional[str] = field(
-        default="gsm8k",
-    )
-    mask_id: int = field(
-        default=126336,
-        metadata={"help": "Mask token id. Default is from Llada"},
-    )
-
-    # Parameters that control uploading checkpoints
-    upload_to_google_drive: bool = field(
-        default=False,
-        metadata={"help": "If True, upload the saved checkpoints to Google Drive"}
-    )
-    google_drive_parent_folder_id: str = field(
-        default=None,
-        metadata={"help": "Google Drive parent folder ID to upload checkpoints. "
-                  "Default is None, which uploads to sub directories in the root directory. "
-                  "Folder ID can be obtained from the URL when opening the folder in browser, not the complete URL. "
-                  "Example: https://drive.google.com/drive/u/0/folders/google_drive_folder_id"}
-    )
 
     #################### new params for DMPO ####################
     alpha: float = field(
-        default=0.1,
+        default=0.04,
         metadata={"help": r"If >= 0.0, temperature \alpha for CE loss, p_* \propto p_{pre} e^{r / \alpha}; "
                   "If = -1, this means use reward as the advantage"}
     )
@@ -101,7 +132,7 @@ class DMPOConfig(GRPOConfig):
 
     # For compute_loss
     num_replicates: int = field(
-        default=2,
+        default=4,
         metadata={"help": "Number of replicates of each roll-out for CE loss"}
     )
     loss_antithetic: bool = field(
@@ -114,7 +145,7 @@ class DMPOConfig(GRPOConfig):
         metadata={"help": "Whether to clamp the mask probabilities to the range [0.1, 0.9] when computing loss"}
     )
     loss_mask_non_eos: bool = field(
-        default= True, # True,
+        default= False, # True,
         metadata={"help": "If True, only apply mask on non EOS positions"}
     )
 
@@ -123,15 +154,6 @@ class DMPOConfig(GRPOConfig):
     log_rnd_omit_eos: bool = field(
         default=False,
         metadata={"help": "Whether to omit the log RND after the first EOS token when computing advantage"}
-    )
-    log_rnd_normalize_by_length: bool = field(
-        default=False,
-        metadata={"help": "Whether to normalize the log RND by the true generation length, "
-                  "i.e., the length of the generated sequence until the first EOS token"}
-    )
-    log_rnd_normalize_power: float = field(
-        default=1.0,
-        metadata={"help": "When log_rnd_normalize_by_length is True, the power to raise the true generation length to"}
     )
     ## proximal step
     coeff: float = field(
@@ -150,7 +172,7 @@ class DMPOConfig(GRPOConfig):
 
     ## computing advantage
     advantage_centering: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to center the advantage for the completion of the same prompt "
                   "by subtracting the mean"}
     )
@@ -161,14 +183,29 @@ class DMPOConfig(GRPOConfig):
     )
     
     advantage_centering_neg: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to use the negative advantage for the completion of the same prompt "
                   "by subtracting the mean"}
     )
+
     
-    advantage_centering_warmup: int = field(
-        default=100,
-        metadata={"help": "Number of steps to warm up the advantage centering before using the unbias version"}
+    compute_ref_log_prob_elbo: bool = field(
+        default=True,
+        metadata={"help": "Whether to compute the reference log probability for the ELBO loss"}
+    )
+    
+    compute_ref_log_prob_elbo_size: int = field(
+        default=4,
+        metadata={"help": "Batch size of the reference log probability for the ELBO loss"}
+    )
+    
+    use_sft_model: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the SFT model as the reference model"}
+    )
+    sft_model_path: str = field(
+        default=None,
+        metadata={"help": "Path to the SFT model to be used as the reference model"}
     )
     
     ## computing loss
@@ -189,18 +226,3 @@ class DMPOConfig(GRPOConfig):
         metadata={"help": "Whether to use two independent sets of samples for DDO loss"}
     )
     
-    advantage_div_std: bool = field(
-        default=False,
-        metadata={"help": "Whether to normalize the advantage for the completion of the same prompt "
-                  "by dividing by the standard deviation"}
-    )
-    advantage_div_eta: bool = field(
-        default=False,
-        metadata={"help": "Whether to normalize the advantage for the completion of the same prompt "
-                  "by dividing by the eta. Only applies when ada_coeff and advantage_centering are True"}
-    )
-    advantage_div_eta_threshold: float = field(
-        default=0.01,
-        metadata={"help": "When advantage_div_eta is True, and when eta is below this threshold, "
-                  "divide the loss by this value to maintain the reasonable range of the loss"}
-    )

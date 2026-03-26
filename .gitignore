@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Training outputs and logs
+outputs/
+wandb/
+*.log
+nohup.out
+
+# Evaluation results
+eval_results/
+eval_outputs/
+pass_k_results/
+
+# Model checkpoints
+*.pth
+*.npz
+checkpoints/
+d1_checkpoints/
+
+# Credentials
+credentials.json
+token.json
+
+# Build artifacts
+build/
+dist/

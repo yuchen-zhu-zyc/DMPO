@@ -5,6 +5,7 @@ import glob
 import tiktoken
 from collections import defaultdict
 from parser_helper import is_equiv, remove_boxed, last_boxed_only_string
+import argparse
 
 
 def count_effective_tokens(text):
@@ -438,14 +439,13 @@ def aggregate_results(directory="."):
 
 
 if __name__ == "__main__":
-    # run_name = "0910094044"
-    # run_name = "0911173733""
-    # run_name = "0912094841"
-    # run_name = "0913183247"
-    # run_name = "0906150938"
-    # run_name = "0927224301"
-    # run_name = "0928125834"
-    run_name = "0928233420"
-    
-    results_dir = f"../eval_results/{run_name}_full_steps"
-    aggregate_results(directory=results_dir)
+    parser = argparse.ArgumentParser(description="Aggregate results from JSON files.")
+    parser.add_argument(
+        "--dir",
+        type=str,
+        default="eval_baselines",
+        help="Directory containing JSON files (default: eval_baselines)",
+    )
+    args = parser.parse_args()
+
+    aggregate_results(directory=args.dir)
