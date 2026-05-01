@@ -10,9 +10,11 @@ This is the official implementation of DMPO.
 
 
 ## Update
+[Apr 30, 2026] DMPO accepted to ICML 2026 as Spotlight!
+
 [Mar 25, 2026] Major code update: added fast KV-cache samplers (Fast-dLLM, WINO), ELBO-based reference log-probability estimation, and improved evaluation pipeline.
 
-[Oct 9, 2025] We have open sourced the code of DMPO for dLLM training.
+[Oct 9, 2025] We have open-sourced the code of DMPO for dLLM training.
 
 
 ## Environment Installation
