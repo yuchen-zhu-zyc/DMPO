@@ -139,3 +139,15 @@ python parse_and_get_acc.py --dir <output_dir>
 
 ## Acknowledgement
 This code base is built upon [d1](https://github.com/dllm-reasoning/d1). We thank the authors for providing a clean and reproducible repo. The fast sampler implementations are adapted from [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [WINO-dLLM](https://github.com/Feng-Hong/WINO-DLLM), and [FreeDave](https://github.com/cychomatica/FreeDave).
+
+## Citation
+If you feel our codes useful, please consider citing the paper in the following form:
+```
+@inproceedings{zhu2026enhancing,
+  title     = {Enhancing Reasoning for Diffusion {LLMs} via Distribution Matching Policy Optimization},
+  author    = {Zhu, Yuchen and Guo, Wei and Choi, Jaemoo and Molodyk, Petr and Yuan, Bo and Tao, Molei and Chen, Yongxin},
+  booktitle = {Forty-third International Conference on Machine Learning},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=09CSjVeDug}
+}
+```
