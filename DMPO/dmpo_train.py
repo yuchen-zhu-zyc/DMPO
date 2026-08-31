@@ -33,6 +33,11 @@ from data_utils import (
 
 def main(dmpo_config, model_config):
 
+    if dmpo_config.model_type not in ["llada", "dream"]:
+        raise ValueError("model_type must be 'llada' or 'dream'.")
+    if dmpo_config.model_type == "llada" and dmpo_config.use_fast_sampler == "fast_dream":
+        raise ValueError("LLaDA does not support use_fast_sampler='fast_dream'.")
+
     # Set seed for reproducibility
     set_random_seed(dmpo_config.seed)
 
@@ -80,10 +85,20 @@ def main(dmpo_config, model_config):
     )
 
     # Load model and tokenizer
-    ModelClass = {
-        "fast_dllm": AutoModelFastdLLM,
-        "wino": AutoModelWino,
-        }.get(dmpo_config.use_fast_sampler, AutoModel)
+    if dmpo_config.model_type == "dream":
+        if dmpo_config.use_fast_sampler == "fast_dream":
+            from fast_samplers.fast_dream.modeling_dream import DreamModel
+
+            ModelClass = DreamModel
+        elif dmpo_config.use_fast_sampler == "no":
+            ModelClass = AutoModel
+        else:
+            raise ValueError("Dream requires use_fast_sampler='no' or 'fast_dream'.")
+    else:
+        ModelClass = {
+            "fast_dllm": AutoModelFastdLLM,
+            "wino": AutoModelWino,
+            }.get(dmpo_config.use_fast_sampler, AutoModel)
     
     model_load_path = dmpo_config.pretrained_model_path if not dmpo_config.use_sft_model else dmpo_config.sft_model_path
     
@@ -102,6 +117,12 @@ def main(dmpo_config, model_config):
     )
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
+
+    # Replace the unchanged LLaDA default with Dream's model-specific mask token.
+    if dmpo_config.model_type == "dream" and dmpo_config.mask_id == 126336:
+        dmpo_config.mask_id = getattr(model.config, "mask_token_id", None)
+        if dmpo_config.mask_id is None:
+            dmpo_config.mask_id = 151666
 
     # Configure LoRA for parameter-efficient fine-tuning
     peft_config = LoraConfig(

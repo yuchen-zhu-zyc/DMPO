@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -13,7 +14,6 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 from peft import PeftModel
 
-from generate import generate
 from gsm8k import GSM8KDataset
 from math500 import MATH500Dataset
 from countdown import CTDDataset
@@ -56,6 +56,9 @@ def evaluate(
     cfg_scale=0.0,
     steps=64,
     block_length=32,
+    sampler="dream",
+    sampler_threshold_pd=None,
+    mask_token_id=None,
 ):
     model.eval()
     total_processed = torch.tensor(0, device=model.device)
@@ -71,18 +74,26 @@ def evaluate(
         prompts = batch["prompts"]
         attention_mask = batch["attention_mask"].to(device)
 
-        out = model.diffusion_generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=gen_length,
-            output_history=False,
-            return_dict_in_generate=False,
-            steps=steps,
-            temperature=0.2,
-            top_p=0.95,
-            alg="entropy",
-            alg_temp=0.,
-        )
+        generation_kwargs = {
+            "attention_mask": attention_mask,
+            "max_new_tokens": gen_length,
+            "output_history": False,
+            "return_dict_in_generate": False,
+            "steps": steps,
+            "temperature": temperature,
+            "top_p": 0.95,
+            "alg": "confidence_threshold" if sampler_threshold_pd is not None else "entropy",
+            "alg_temp": 0.0,
+            "mask_token_id": mask_token_id,
+        }
+        if sampler != "dream":
+            generation_kwargs["block_length"] = block_length
+            generation_kwargs["dual_cache"] = sampler == "dream_dual_cache"
+            generation_kwargs["threshold"] = (
+                sampler_threshold_pd if sampler_threshold_pd is not None else 0.9
+            )
+
+        out = model.diffusion_generate(input_ids, **generation_kwargs)
 
         generated_texts = tokenizer.batch_decode(out[:, -gen_length:], skip_special_tokens=False)
         example_result = [
@@ -177,7 +188,16 @@ if __name__ == "__main__":
     local_rank = setup_ddp()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
+    parser.add_argument("--model_path", type=str, default="Dream-org/Dream-v0-Instruct-7B")
+    parser.add_argument("--use_fast_sampler", type=str, default="no", choices=["no", "fast_dream"])
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="dream",
+        choices=["dream", "dream_prefix_cache", "dream_dual_cache"],
+    )
+    parser.add_argument("--sampler_threshold_pd", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--few_shot", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
@@ -202,11 +222,28 @@ if __name__ == "__main__":
 
     num_evals = {"gsm8k": -1, "math": -1, "countdown": 256, "sudoku": 256}
 
-    model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
+    if args.sampler == "dream" and args.use_fast_sampler != "no":
+        raise ValueError("Sampler 'dream' requires --use_fast_sampler no.")
+    if args.sampler == "dream" and args.sampler_threshold_pd is not None:
+        raise ValueError("The native Dream sampler does not support --sampler_threshold_pd.")
+    if args.sampler != "dream" and args.use_fast_sampler != "fast_dream":
+        raise ValueError("Cached Dream samplers require --use_fast_sampler fast_dream.")
+
+    if args.use_fast_sampler == "fast_dream":
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        from fast_samplers.fast_dream.modeling_dream import DreamModel
+        ModelClass = DreamModel
+    else:
+        ModelClass = AutoModel
+
+    model = ModelClass.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
         local_rank
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    mask_token_id = getattr(model.config, "mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = 151666
 
     if args.checkpoint_path:
         model = PeftModel.from_pretrained(model, args.checkpoint_path, torch_dtype=torch.bfloat16).to(
@@ -254,8 +291,12 @@ if __name__ == "__main__":
         tokenizer,
         dataloader,
         gen_length=args.gen_length,
+        temperature=args.temperature,
         block_length=args.block_length,
         steps=args.diffusion_steps,
+        sampler=args.sampler,
+        sampler_threshold_pd=args.sampler_threshold_pd,
+        mask_token_id=mask_token_id,
     )
 
     if not args.dont_save:
@@ -272,6 +313,8 @@ if __name__ == "__main__":
                     "gen_length": args.gen_length,
                     "diffusion_steps": args.diffusion_steps,
                     "block_length": args.block_length,
+                    "sampler": args.sampler,
+                    "temperature": args.temperature,
                 },
                 f,
                 indent=2,

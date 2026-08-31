@@ -10,6 +10,7 @@ from datasets import Dataset, IterableDataset
 import warnings
 import torch.nn.functional as F
 from DMPO_config import DMPOConfig
+from model_utils import align_logits_and_targets
 from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
 from torch import nn
@@ -69,25 +70,43 @@ class DMPOTrainer(GRPOTrainer):
         if args.loss_antithetic and (args.num_replicates % 2 == 1 or self.args.compute_ref_log_prob_elbo_size % 2 == 1):
             logger.warning("num_replicates and compute_ref_log_prob_elbo_size should be even")
 
-        assert args.use_fast_sampler in ["fast_dllm", "wino", "no"], "Invalid fast sampler"
-        assert args.sampler in ["roar", "llada", "pd", "pd_cache_prefix", "pd_cache_dual", "wino"], "Invalid sampler"
-        if args.sampler in ["pd_cache_prefix", "pd_cache_dual"]:
-            assert args.use_fast_sampler == "fast_dllm", \
-                "Samplers `pd_cache_prefix` and `pd_cache_dual` can only be used for Fast-dLLM"
-        if args.sampler == "wino":
-            assert args.use_fast_sampler == "wino", "Sampler `wino` can only be used for WINO"
+        assert args.model_type in ["llada", "dream"], "Invalid model type"
 
-        if args.sampler != "roar":
+        if args.model_type == "dream":
+            assert args.use_fast_sampler in ["fast_dream", "no"], "Invalid Dream fast sampler"
+            assert args.sampler in ["dream", "dream_prefix_cache", "dream_dual_cache"], "Invalid Dream sampler"
+            if args.sampler == "dream":
+                assert args.use_fast_sampler == "no", \
+                    "Sampler `dream` uses the native Dream model and requires use_fast_sampler='no'"
+                assert args.sampler_threshold_pd is None, \
+                    "The native Dream sampler does not support sampler_threshold_pd"
+            else:
+                assert args.use_fast_sampler == "fast_dream", \
+                    "Cached Dream samplers require use_fast_sampler='fast_dream'"
             if not self.args.compute_ref_log_prob_elbo:
                 self.args.compute_ref_log_prob_elbo = True
                 warnings.warn("`self.args.compute_ref_log_prob_elbo` set to True! "
                               "Require ELBO to approximate sequence log probability.")
-            self.generate = {"llada": generate_llada,
-                             "pd": generate_pd,
-                             "pd_cache_prefix": generate_with_prefix_cache,
-                             "pd_cache_dual": generate_with_dual_cache,
-                             "wino": generate_wino,
-                             }[args.sampler]
+        else:
+            assert args.use_fast_sampler in ["fast_dllm", "wino", "no"], "Invalid fast sampler"
+            assert args.sampler in ["roar", "llada", "pd", "pd_cache_prefix", "pd_cache_dual", "wino"], "Invalid sampler"
+            if args.sampler in ["pd_cache_prefix", "pd_cache_dual"]:
+                assert args.use_fast_sampler == "fast_dllm", \
+                    "Samplers `pd_cache_prefix` and `pd_cache_dual` can only be used for Fast-dLLM"
+            if args.sampler == "wino":
+                assert args.use_fast_sampler == "wino", "Sampler `wino` can only be used for WINO"
+
+            if args.sampler != "roar":
+                if not self.args.compute_ref_log_prob_elbo:
+                    self.args.compute_ref_log_prob_elbo = True
+                    warnings.warn("`self.args.compute_ref_log_prob_elbo` set to True! "
+                                  "Require ELBO to approximate sequence log probability.")
+                self.generate = {"llada": generate_llada,
+                                 "pd": generate_pd,
+                                 "pd_cache_prefix": generate_with_prefix_cache,
+                                 "pd_cache_dual": generate_with_dual_cache,
+                                 "wino": generate_wino,
+                                 }[args.sampler]
 
     #################### loss computation and buffer preparation ####################
 
@@ -153,10 +172,13 @@ class DMPOTrainer(GRPOTrainer):
         perturbed_input_ids = torch.where(full_masked_index, self.args.mask_id, input_ids)
         logits = model(perturbed_input_ids).logits # [bs * num_replicates, seq_len, vocab_size]
 
+        logits, ce_targets, ce_mask = align_logits_and_targets(
+            self.args.model_type, logits, input_ids, full_masked_index
+        )
         # the following implementation using F.cross_entropy is equivalent and more efficient
-        losses = F.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=input_ids.view(-1), reduction='none').view(logits.shape[:-1])
+        losses = F.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=ce_targets.view(-1), reduction='none').view(logits.shape[:-1])
         # [N := bs * num_replicates * seq_len, vocab_size], [N] -> [N] -> [bs * num_replicates, seq_len], don't require logits to be log-softmaxed
-        losses[~full_masked_index] = 0
+        losses[~ce_mask] = 0
         
         if self.args.loss == "wdce":
             advantages, negative_advantages = [
@@ -251,16 +273,23 @@ class DMPOTrainer(GRPOTrainer):
         
         with self.accelerator.unwrap_model(model).disable_adapter():
             logits_ref = model(perturbed_input_ids).logits # [bs * num_replicates, seq_len, vocab_size]
-        
-        losses_cur = F.cross_entropy(input=logits_cur.view(-1, logits_cur.shape[-1]), target=input_ids.view(-1), reduction='none').view(logits_cur.shape[:-1])
+
+        logits_cur, ce_targets, ce_mask = align_logits_and_targets(
+            self.args.model_type, logits_cur, input_ids, full_masked_index
+        )
+        logits_ref, _, _ = align_logits_and_targets(
+            self.args.model_type, logits_ref, input_ids, full_masked_index
+        )
+
+        losses_cur = F.cross_entropy(input=logits_cur.view(-1, logits_cur.shape[-1]), target=ce_targets.view(-1), reduction='none').view(logits_cur.shape[:-1])
         # [N := bs * num_replicates * seq_len, vocab_size], [N] -> [N] -> [bs * num_replicates, seq_len], don't require logits to be log-softmaxed
-        losses_cur[~full_masked_index] = 0
+        losses_cur[~ce_mask] = 0
         log_prob_cur = (-losses_cur).view(repeated_size, batch_size, -1).transpose(0, 1) # [bs, repeated_size, seq_len]
         t_weights = (gen_length / m).view(-1, batch_size, 1).transpose(0, 1) # [bs, repeated_size, 1]
         log_prob_cur = (t_weights * log_prob_cur).mean(dim = 1) # [bs, seq_len]
         
-        losses_ref = F.cross_entropy(input=logits_ref.view(-1, logits_ref.shape[-1]), target=input_ids.view(-1), reduction='none').view(logits_ref.shape[:-1])
-        losses_ref[~full_masked_index] = 0
+        losses_ref = F.cross_entropy(input=logits_ref.view(-1, logits_ref.shape[-1]), target=ce_targets.view(-1), reduction='none').view(logits_ref.shape[:-1])
+        losses_ref[~ce_mask] = 0
         log_prob_ref = (-losses_ref).view(repeated_size, batch_size, -1).transpose(0, 1) # [bs, repeated_size, seq_len]
         t_weights = (gen_length / m).view(-1, batch_size, 1).transpose(0, 1) # [bs, repeated_size, 1]
         log_prob_ref = (t_weights * log_prob_ref).mean(dim = 1) # [bs, seq_len]
@@ -299,7 +328,33 @@ class DMPOTrainer(GRPOTrainer):
         prompt_completion_ids = []; log_prob_pre = []; log_prob_cur = []
         for i in range(0, prompt_ids.size(0), generation_batch_size):
             end_idx = min(i + generation_batch_size, prompt_ids.size(0))
-            if self.args.sampler == 'roar':
+            if self.args.model_type == "dream":
+                generation_kwargs = {
+                    "attention_mask": prompt_mask[i:end_idx],
+                    "max_new_tokens": self.args.max_completion_length,
+                    "output_history": False,
+                    "return_dict_in_generate": False,
+                    "steps": self.args.sampler_steps,
+                    "temperature": self.args.temperature,
+                    "top_p": 0.95,
+                    "alg": "confidence_threshold" if self.args.sampler_threshold_pd is not None else "entropy",
+                    "alg_temp": 0.0,
+                    "mask_token_id": self.args.mask_id,
+                }
+                if self.args.sampler != "dream":
+                    generation_kwargs["block_length"] = self.args.block_length
+                    generation_kwargs["dual_cache"] = self.args.sampler == "dream_dual_cache"
+                    generation_kwargs["threshold"] = (
+                        self.args.sampler_threshold_pd
+                        if self.args.sampler_threshold_pd is not None
+                        else 0.9
+                    )
+
+                batch_prompt_completion_ids = self.accelerator.unwrap_model(self.model).diffusion_generate(
+                    prompt_ids[i:end_idx],
+                    **generation_kwargs,
+                )
+            elif self.args.sampler == 'roar':
                 batch_prompt_completion_ids, batch_log_prob_pre, batch_log_prob_cur = self.generate_and_compute_log_rnd(
                     prompt=prompt_ids[i:end_idx],
                     gen_length=self.args.max_completion_length,

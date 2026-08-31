@@ -15,6 +15,12 @@ class DMPOConfig(GRPOConfig):
     command line.
     """
 
+    # Parameters that control model type
+    model_type: str = field(
+        default="llada",
+        metadata={"help": "Model type. Can be 'llada' or 'dream'."},
+    )
+
     # Parameters that control generation
     generation_batch_size: Optional[int] = field(
         default=16,
@@ -40,7 +46,7 @@ class DMPOConfig(GRPOConfig):
     use_fast_sampler: str = field(
         default="fast_dllm",
         metadata={"help": "Whether to use fast samplers with KV cache for training. "
-                          "Can be 'fast_dllm', 'wino', or 'no' (use the default sampler in the model)."},
+                          "Can be 'fast_dllm', 'fast_dream', 'wino', or 'no' (use the default sampler in the model)."},
     )
     sampler: str = field(
         default="pd_cache_prefix",
@@ -50,13 +56,15 @@ class DMPOConfig(GRPOConfig):
                           "pd: confidence-aware parallel decoding as in Fast-dLLM (without KV cache).\n"
                           "pd_cache_prefix, pd_cache_dual: confidence-aware parallel decoding as in Fast-dLLM (with KV cache).\n"
                           "wino: Wide-In, Narrow-Out (with KV cache).\n"
+                          "dream: the default Dream sampler.\n"
+                          "dream_prefix_cache, dream_dual_cache: Dream sampling with KV cache.\n"
                           },
     )
 
     sampler_steps: int = field(
         default=128,
         metadata={"help": "Number of steps for sampling in non-roar samplers, "
-                          "including llada, pd, pd_cache_prefix, pd_cache_dual. "
+                          "including llada, pd, pd_cache_prefix, pd_cache_dual, and Dream samplers. "
                           "Note that max_completion_length = 256."}
     )
     sampler_remasking: str = field(
@@ -68,7 +76,8 @@ class DMPOConfig(GRPOConfig):
 
     sampler_threshold_pd: Optional[float] = field(
         default=None,
-        metadata={"help": "Confidence threshold, only for pd, pd_cache_prefix, pd_cache_dual."}
+        metadata={"help": "Confidence threshold for PD and cached Dream samplers. "
+                          "When set for cached Dream, confidence-threshold decoding is used."}
     )
     sampler_factor: Optional[int] = field(
         default=None,
@@ -225,4 +234,3 @@ class DMPOConfig(GRPOConfig):
         default=False,
         metadata={"help": "Whether to use two independent sets of samples for DDO loss"}
     )
-    

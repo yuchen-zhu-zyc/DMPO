@@ -10,6 +10,8 @@ This is the official implementation of DMPO.
 
 
 ## Update
+[Aug 30, 2026] Added Dream 7B support for DMPO training and evaluation.
+
 [Apr 30, 2026] DMPO accepted to ICML 2026 as Spotlight!
 
 [Mar 25, 2026] Major code update: added fast KV-cache samplers (Fast-dLLM, WINO), ELBO-based reference log-probability estimation, and improved evaluation pipeline.
@@ -138,7 +140,7 @@ python parse_and_get_acc.py --dir <output_dir>
 
 
 ## Acknowledgement
-This code base is built upon [d1](https://github.com/dllm-reasoning/d1). We thank the authors for providing a clean and reproducible repo. The fast sampler implementations are adapted from [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [WINO-dLLM](https://github.com/Feng-Hong/WINO-DLLM), and [FreeDave](https://github.com/cychomatica/FreeDave).
+This code base is built upon [d1](https://github.com/dllm-reasoning/d1). We thank the authors for providing a clean and reproducible repo. The fast sampler implementations are adapted from [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [WINO-dLLM](https://github.com/Feng-Hong/WINO-DLLM), and [FreeDave](https://github.com/cychomatica/FreeDave). The Dream model implementation is adapted from [Dream](https://github.com/DreamLM/Dream).
 
 ## Citation
 If you feel our codes useful, please consider citing the paper in the following form:
